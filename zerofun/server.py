@@ -2,6 +2,7 @@ import time
 import concurrent.futures
 from collections import deque, namedtuple
 
+import elements
 import numpy as np
 
 from . import sockets
@@ -28,7 +29,9 @@ class Server:
     self.result_set = set()
     self.done_queue = deque()
     self.done_proms = deque()
+    self.agg = elements.Agg()
     self.loop = thread.StoppableThread(self._loop, name=f'{name}_loop')
+    self.exception = None
 
   def bind(self, name, workfn, donefn=None, workers=0, batch=0):
     if workers:
@@ -51,6 +54,10 @@ class Server:
       assert not pool._broken
     [not x.done() or x.result() for x in self.result_set.copy()]
     [not x.done() or x.result() for x in self.done_proms.copy()]
+    if self.exception:
+      exception = self.exception
+      self.exception = None
+      raise exception
 
   def close(self):
     self._print('Shutting down')
@@ -79,6 +86,7 @@ class Server:
 
   def stats(self):
     return {
+        **self.agg.result(),
         'result_set': len(self.result_set),
         'done_queue': len(self.done_queue),
         'done_proms': len(self.done_proms),
@@ -139,8 +147,11 @@ class Server:
         if method.batched:
           for addr, rid, payload in zip(addr, rid, payload):
             socket.send_result(addr, rid, payload)
+          for recvd in recvd:
+            self.agg.add('result_time', now - recvd, ('min', 'avg', 'max'))
         else:
           socket.send_result(addr, rid, payload)
+          self.agg.add('result_time', now - recvd, ('min', 'avg', 'max'))
       except Exception as e:
         if method.batched:
           for addr, rid in zip(future.addr, future.rid):
@@ -148,7 +159,7 @@ class Server:
         else:
           socket.send_error(future.addr, future.rid, repr(e))
         if self.errors:
-          raise
+          self.exception = e
       finally:
         if not method.donefn:
           method.inprog[0] -= 1
@@ -190,4 +201,4 @@ class Server:
     return addr, rid, payload, logs, recvd
 
   def _print(self, text):
-    print(f'[{self.name}] {text}')
+    elements.print(f'[{self.name}] {text}')

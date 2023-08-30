@@ -29,6 +29,7 @@ class ClientSocket:
     self.socket = zmq.Context.instance().socket(zmq.DEALER)
     self.socket.setsockopt(zmq.IDENTITY, identity.to_bytes(16, 'big'))
     self.socket.setsockopt(zmq.IPV6, int(ipv6))
+    self.socket.setsockopt(zmq.LINGER, 0)
     self.socket.set_hwm(0)
     self.pings = pings
     self.maxage = maxage
@@ -155,6 +156,7 @@ class ServerSocket:
       addr = f'tcp://*:{port}'
     self.socket = zmq.Context.instance().socket(zmq.ROUTER)
     self.socket.setsockopt(zmq.IPV6, ipv6)
+    self.socket.setsockopt(zmq.LINGER, 0)
     self.socket.set_hwm(0)
     self.socket.bind(addr)
     self.alive = {}

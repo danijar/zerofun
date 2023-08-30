@@ -1,4 +1,7 @@
 import multiprocessing as mp
+import os
+import queue
+import signal
 import sys
 
 import cloudpickle
@@ -16,7 +19,8 @@ class Process:
     fn = cloudpickle.dumps(fn)
     inits = cloudpickle.dumps(self.initializers)
     context = mp.get_context()
-    self.errqueue = context.SimpleQueue()
+    self.errqueue = context.Queue()
+    self.exception = None
     self.process = context.Process(target=self._wrapper, name=name, args=(
         fn, name, args, utils.get_print_lock(), self.errqueue, inits))
     self.started = False
@@ -31,8 +35,11 @@ class Process:
     return self.process.pid
 
   @property
-  def alive(self):
-    return self.process.is_alive()
+  def running(self):
+    running = self.process.is_alive()
+    if running:
+      assert self.exitcode is None, self.exitcode
+    return running
 
   @property
   def exitcode(self):
@@ -44,21 +51,39 @@ class Process:
     self.process.start()
 
   def check(self):
-    assert self.started
     if self.process.exitcode not in (None, 0):
-      raise self.errqueue.get()
+      if self.exception is None:
+        try:
+          self.exception = self.errqueue.get(timeout=0.1)
+        except queue.Empty:
+          if self.exitcode in (-15, 15):
+            msg = 'Process was terminated.'
+          else:
+            msg = f'Process excited with code {self.exitcode}'
+          self.exception = RuntimeError(msg)
+      self.kill()
+      raise self.exception
 
   def join(self, timeout=None):
-    self.check()
-    self.process.join(timeout)
-
-  def terminate(self):
-    if not self.alive:
+    if self.exitcode in (-15, 15):
+      assert not self.running
       return
-    self.process.terminate()
+    self.check()
+    if self.running:
+      self.process.join(timeout)
+
+  def kill(self):
+    utils.kill_subprocs(self.pid)
+    if self.running:
+      self.process.terminate()
+      self.process.join(timeout=0.1)
+    if self.running:
+      os.kill(self.pid, signal.SIGKILL)
+      self.process.join(timeout=1.0)
+    assert not self.running, self.name
 
   def __repr__(self):
-    attrs = ('name', 'pid', 'started', 'exitcode')
+    attrs = ('name', 'pid', 'running', 'exitcode')
     attrs = [f'{k}={getattr(self, k)}' for k in attrs]
     return f'{type(self).__name__}(' + ', '.join(attrs) + ')'
 
@@ -75,6 +100,9 @@ class Process:
       utils.warn_remote_error(e, name, lock)
       errqueue.put(e)
       sys.exit(1)
+    finally:
+      pid = mp.current_process().pid
+      utils.kill_subprocs(pid)
 
 
 class StoppableProcess(Process):
@@ -91,15 +119,13 @@ class StoppableProcess(Process):
     self.runflag.set()
     super().start()
 
-  def stop(self, wait=10):
+  def stop(self, wait=1):
     self.check()
-    if not self.alive:
+    if not self.running:
       return
     self.runflag.clear()
     if wait is True:
       self.join()
     elif wait:
       self.join(wait)
-      if self.alive:
-        print(f"Terminating process '{self.name}' that did not want to stop.")
-        self.terminate()
+      self.kill()

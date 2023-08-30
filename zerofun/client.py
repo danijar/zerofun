@@ -3,6 +3,7 @@ import weakref
 from functools import partial as bind
 from collections import deque
 
+import elements
 import numpy as np
 
 from . import sockets
@@ -24,6 +25,9 @@ class Client:
     self.socket = sockets.ClientSocket(identity, ipv6, pings, maxage)
     self.futures = weakref.WeakValueDictionary()
     self.queue = deque()
+    self.conn_per_sec = elements.FPS()
+    self.send_per_sec = elements.FPS()
+    self.recv_per_sec = elements.FPS()
     connect and self.connect()
 
   def __getattr__(self, name):
@@ -38,8 +42,12 @@ class Client:
     return {
         'futures': len(self.futures),
         'inflight': len(self.queue),
+        'conn_per_sec': self.conn_per_sec.result(),
+        'send_per_sec': self.send_per_sec.result(),
+        'recv_per_sec': self.recv_per_sec.result(),
     }
 
+  @elements.timer.section('client_connect')
   def connect(self, retry=True, timeout=10):
     while True:
       self.resolved = self._resolve(self.address)
@@ -47,6 +55,7 @@ class Client:
       try:
         self.socket.connect(self.resolved, timeout)
         self._print('Connection established')
+        self.conn_per_sec.step(1)
         return
       except sockets.ProtocolError as e:
         self._print(f'Ignoring unexpected message: {e}')
@@ -57,15 +66,17 @@ class Client:
       else:
         raise sockets.ConnectError
 
+  @elements.timer.section('client_call')
   def call(self, method, data):
     assert len(self.futures) < 1000, (
         f'Too many unresolved requests in client {self.name}.\n' +
         f'Futures: {len(self.futures)}\n' +
         f'Resolved: {sum([x.done() for x in self.futures.values()])}')
     if self.maxinflight:
-      while sum(not x.done() for x in self.queue) >= self.maxinflight:
-        self.queue[0].check()
-        time.sleep(0.001)
+      with elements.timer.section('inflight_wait'):
+        while sum(not x.done() for x in self.queue) >= self.maxinflight:
+          self.queue[0].check()
+          time.sleep(0.001)
     if self.errors:
       try:
         while self.queue[0].done():
@@ -76,6 +87,7 @@ class Client:
     data = {k: np.asarray(v) for k, v in data.items()}
     data = sockets.pack(data)
     rid = self.socket.send_call(method, data)
+    self.send_per_sec.step(1)
     future = Future(self._receive, rid)
     self.futures[rid] = future
     if self.errors or self.maxinflight:
@@ -85,6 +97,7 @@ class Client:
   def close(self):
     return self.socket.close()
 
+  @elements.timer.section('client_receive')
   def _receive(self, rid, retry):
     while rid in self.futures and not self.futures[rid].done():
       result = self._listen()
@@ -92,6 +105,7 @@ class Client:
         return
       time.sleep(0.0001)
 
+  @elements.timer.section('client_listen')
   def _listen(self):
     try:
       result = self.socket.receive()
@@ -99,6 +113,7 @@ class Client:
         other, payload = result
         if other in self.futures:
           self.futures[other].set_result(sockets.unpack(payload))
+        self.recv_per_sec.step(1)
       return result
     except sockets.NotAliveError:
       self._print('Server is not responding')
@@ -111,12 +126,13 @@ class Client:
     except sockets.ProtocolError as e:
       self._print(f'Ignoring unexpected message: {e}')
 
+  @elements.timer.section('client_resolve')
   def _resolve(self, address):
     protocol, address = address.split('://', 1)
     return f'{protocol}://{address}'
 
   def _print(self, text):
-    print(f'[{self.name}] {text}')
+    elements.print(f'[{self.name}] {text}')
 
 
 class Future:

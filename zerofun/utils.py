@@ -1,49 +1,61 @@
 import multiprocessing as mp
+import socket
 import sys
 import time
 import traceback
 
+import elements
+import psutil
 
-PRINT_LOCK = None
+
+_PRINT_LOCK = None
 def get_print_lock():
-  global PRINT_LOCK
-  if not PRINT_LOCK:
-    PRINT_LOCK = mp.get_context().Lock()
-  return PRINT_LOCK
+  global _PRINT_LOCK
+  if not _PRINT_LOCK:
+    _PRINT_LOCK = mp.get_context().Lock()
+  return _PRINT_LOCK
+
+
+_PORTS = iter(range(5000, 8000))
+def get_free_port():
+  while True:
+    port = next(_PORTS)
+    if port_free(port):
+      return port
+
+
+def port_free(port):
+  with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    return s.connect_ex(('localhost', int(port)))
 
 
 def run(workers, duration=None):
-
-  for worker in workers:
-    if not worker.started:
-      worker.start()
-
-  start = time.time()
   try:
 
-    while True:
+    for worker in workers:
+      if not worker.started:
+        try:
+          worker.start()
+        except Exception:
+          print(f'Failed to start worker {worker.name}')
+          raise
 
+    start = time.time()
+    while True:
       if duration and time.time() - start >= duration:
         print(f'Shutting down workers after {duration} seconds.')
-        [x.terminate() for x in workers]
-        time.sleep(0.1)
+        [x.kill() for x in workers]
         return
-
       if all(x.exitcode == 0 for x in workers):
         print('All workers terminated successfully.')
         return
-
       for worker in workers:
         if worker.exitcode not in (None, 0):
-          print(f'Terminating worker due to error in {worker.name}')
-
-          # Wait for everybody who wants to print their error messages.
-          time.sleep(0.1)
-
-          # Stop all workers that are not yet stopped.
-          [x.terminate() for x in workers]
+          time.sleep(0.1)  # Wait for workers to print their error messages.
           msg = f'Terminated workers due to crash in {worker.name}.'
-          raise RuntimeError(msg)
+          print(msg)
+          worker.check()
+          raise RuntimeError(msg)  # In case the check did not raise.
       time.sleep(0.1)
 
   finally:
@@ -51,17 +63,68 @@ def run(workers, duration=None):
     # survive program shutdown after an exception then ports may not be freeed
     # up. Even worse, clients of the new program execution could connect to
     # servers of the previous program execution that did not get cleaned up.
-    [x.terminate() for x in workers]
+    [x.kill() for x in workers]
+
+
+def kill_subprocs(parent=None):
+  try:
+    procs = list(psutil.Process(parent).children(recursive=True))
+  except psutil.NoSuchProcess:
+    return
+  for proc in procs:
+    try:
+      proc.terminate()
+    except psutil.NoSuchProcess:
+      pass
+  for proc in procs:
+    try:
+      proc.wait(timeout=0.1)
+    except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+      pass
+  for proc in procs:
+    try:
+      proc.kill()
+    except psutil.NoSuchProcess:
+      pass
+  for proc in procs:
+    try:
+      proc.wait(timeout=0.1)
+    except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+      pass
+  for proc in procs:
+    assert not proc_alive(proc.pid)
+
+
+def kill_proc(pid):
+  try:
+    proc = psutil.Process(pid)
+    proc.terminate()
+    try:
+      proc.wait(timeout=0.1)
+    except psutil.TimeoutExpired:
+      proc.kill()
+      proc.wait(timeout=0.1)
+  except psutil.NoSuchProcess:
+    pass
+
+
+def proc_alive(pid):
+  try:
+    return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+  except psutil.NoSuchProcess:
+    return False
 
 
 def warn_remote_error(e, name, lock=get_print_lock):
   lock = lock() if callable(lock) else lock
-  summary = list(traceback.format_exception_only(e))[0].strip('\n')
-  full = ''.join(traceback.format_exception(e)).strip('\n')
+  typ, tb = type(e), e.__traceback__
+  summary = list(traceback.format_exception_only(typ, e))[0].strip('\n')
+  full = ''.join(traceback.format_exception(typ, e, tb)).strip('\n')
   msg = f"Exception in worker '{name}' ({summary}). "
   msg += 'Call check() to reraise in main process. '
   msg += f'Worker stack trace:\n{full}'
-  print(msg, 'red')
+  with lock:
+    elements.print(msg, 'red')
   if sys.version_info.minor >= 11:
     e.add_note(f'\nWorker stack trace:\n\n{full}')
 

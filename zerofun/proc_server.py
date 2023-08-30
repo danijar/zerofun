@@ -1,6 +1,7 @@
 import collections
 import time
 
+import elements
 import numpy as np
 
 from . import process
@@ -66,7 +67,7 @@ class ProcServer:
     queues = collections.defaultdict(list)
     buffers = collections.defaultdict(dict)
     pending = {}
-    print(f'[{name}] Listening at {address}')
+    elements.print(f'[{name}] Listening at {address}')
 
     while context.running:
 
